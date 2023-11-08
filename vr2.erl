@@ -42,10 +42,13 @@
 %% =============================================================================
 %% Message handlers
 %% =============================================================================
-%% TODO: below
 handle_start_viewchange(State, Msg) -> void.
 
 handle_do_viewchange(State, Msg) -> void.
+
+handle_commit(State, Msg) -> void.
+
+handle_start_view(State, Msg) -> void.
 
 %% =============================================================================
 %% Exported functions
@@ -85,10 +88,34 @@ primary(State) ->
         {From, StartVC} when is_record(StartVC, start_viewchange) -> 
             receive_msg(From, StartVC, fun handle_start_viewchange/2, State);
         {From, DoVC} when is_record(DoVC, do_viewchange) -> 
-            receive_msg(From, DoVC, fun handle_do_viewchange/2, State)
+            receive_msg(From, DoVC, fun handle_do_viewchange/2, State);
+        Unexpected -> io:format("unexpected message ~p~n", [Unexpected])            
     end.
     
-backup(State) -> void.
+backup(State) ->
+    receive
+        {From, Commit} when is_record(Commit, commit) -> 
+            receive_msg(From, Commit, fun handle_commit/2, State);
+        {From, StartVC} when is_record(StartVC, start_viewchange) -> 
+            receive_msg(From, StartVC, fun handle_start_viewchange/2, State);
+        {From, DoVC} when is_record(DoVC, do_viewchange) -> 
+            receive_msg(From, DoVC, fun handle_do_viewchange/2, State);
+        Unexpected -> io:format("unexpected message ~p~n", [Unexpected])            
+    after
+        1000 ->
+            %% Send STARTVIEWCHANGE to all other replicas
+            V = State#state.view_number,
+            I = State#state.replica_number,
+            Msg = #start_viewchange{view_number=V+1, replica_number=I},
+            Cfg = State#state.configuration,
+            case send_msg(Msg, Cfg, 3) of
+                ok -> ok;
+                {error, Fails} -> io:format("Message failed to send to: ~p~n", Fails)
+            end,
+            %% Update and return new state
+            NewState = State#state{view_number=V+1, status="view-change"},
+            NewState
+    end.
 
 %% =============================================================================
 %% Message-passing framework functions
@@ -96,6 +123,7 @@ backup(State) -> void.
 
 %% @doc Sends a message to a list of nodes, retrying a specified number of times
 %% for each node if no ack response is received.
+%% TODO: !! consider sending message to all nodes except current node here !!
 -spec send_msg(msg(), list(node()), integer()) -> ok | {error, list(node())}.
 send_msg(Msg, [Node], Retries) -> 
     Node ! {node(), Msg},

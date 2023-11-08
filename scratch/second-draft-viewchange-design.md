@@ -54,6 +54,13 @@ be idempotent and not require any de-duplication. Other messages require
 de-duplication, but only up to a certain point, after which the protocol will
 automatically discard the messages (e.g. if they are from a previous view). As
 a result, I think we should *do de-duplication in the message-specific handlers.*
+- I think we should have a separate map for each type of message, storing all
+messages that get sent in a certain interval of time. The nice thing about VR is
+that there are pretty defined scopes of time, so we can clear each map (or each
+cache, if we want to call it that) once its contents are no longer needed. For
+example, all messages related to view changes can be discarded once a view
+change is completed, since the protocol will already (I think) reject future 
+messages related to a past view change. 
 
 ## Development plan
 - Write code and test in small increments. Once tests pass and you're reasonably
