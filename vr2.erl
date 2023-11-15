@@ -1,6 +1,6 @@
 -module(vr2).
 -include_lib("eunit/include/eunit.hrl").
--export([start/1]).
+-export([start/1, send2others/3]).
 
 -record(state, {configuration,
                         replica_number,
@@ -139,7 +139,7 @@ send_msg(Msg, [Node], Retries) ->
         end
     end;
 send_msg(Msg, Nodes, Retries) ->
-    Resp = list:map(fun(X) -> send_msg(Msg, [X], Retries) end, Nodes),
+    Resp = lists:map(fun(X) -> send_msg(Msg, [X], Retries) end, Nodes),
     %% Build a list of nodes that failed to deliver the message
     Fails = [ X || {error, [X]} <- Resp],
     case Fails of
@@ -149,6 +149,12 @@ send_msg(Msg, Nodes, Retries) ->
 
 %% @doc Sends a message using send_msg to all nodes except itself, given a list 
 %% of nodes.
+%% TODO: It seems like you're slightly misunderstanding how message passing
+%% works, particularly across different nodes. Note that the node atom is NOT
+%% a PID, which is what we need for message passing. That's why you're getting
+%% an invalid destination error. Need to look into this and read about this 
+%% some more.
+-spec send2others(msg(), list(node()), integer()) -> ok | {error, list(node())}.
 send2others(Msg, Nodes, Retries) ->
     Rest = lists:filter(fun(X) -> X /= node() end, Nodes),
     send_msg(Msg, Rest, Retries).
@@ -175,13 +181,15 @@ load_config(File) ->
     case Ret of
         ok -> 
             SplitBin = binary:split(Content, <<"\n">>, [global]),
-            SortedCfg = lists:sort(SplitBin),
+            SortBin = lists:sort(SplitBin),
+            SortedCfg = lists:map(fun(Bin) -> binary_to_atom(Bin) end, SortBin),
             {ok, SortedCfg};
         error -> {error, Content}
     end.
 
 %% @doc Finds the index number of a node in the configuration
 %% NOTE: Can we do something more efficient, like a binary search?
+lookup_node_index(_, [], _) -> -1;
 lookup_node_index(Node, [H|_], Cnt) when H =:= Node -> Cnt;
 lookup_node_index(Node, [_|T], Cnt) -> lookup_node_index(Node, T, Cnt+1).
 
