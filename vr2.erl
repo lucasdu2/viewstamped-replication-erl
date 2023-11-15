@@ -80,7 +80,7 @@ primary(State) ->
     Commit = State#state.commit_number,
     Msg = #commit{view_number=V, commit_number=Commit},
     Cfg = State#state.configuration,
-    case send_msg(Msg, Cfg, 3) of
+    case send2others(Msg, Cfg, 3) of
         ok -> ok;
         {error, Fails} -> io:format("Message failed to send to: ~p~n", Fails)
     end,
@@ -89,6 +89,8 @@ primary(State) ->
             receive_msg(From, StartVC, fun handle_start_viewchange/2, State);
         {From, DoVC} when is_record(DoVC, do_viewchange) -> 
             receive_msg(From, DoVC, fun handle_do_viewchange/2, State);
+        {From, StartV} when is_record(StartV, start_view) ->
+            receive_msg(From, StartV, fun handle_start_view/2, State);
         Unexpected -> io:format("unexpected message ~p~n", [Unexpected])            
     end.
     
@@ -100,6 +102,8 @@ backup(State) ->
             receive_msg(From, StartVC, fun handle_start_viewchange/2, State);
         {From, DoVC} when is_record(DoVC, do_viewchange) -> 
             receive_msg(From, DoVC, fun handle_do_viewchange/2, State);
+        {From, StartV} when is_record(StartV, start_view) ->
+            receive_msg(From, StartV, fun handle_start_view/2, State);
         Unexpected -> io:format("unexpected message ~p~n", [Unexpected])            
     after
         1000 ->
@@ -108,7 +112,7 @@ backup(State) ->
             I = State#state.replica_number,
             Msg = #start_viewchange{view_number=V+1, replica_number=I},
             Cfg = State#state.configuration,
-            case send_msg(Msg, Cfg, 3) of
+            case send2others(Msg, Cfg, 3) of
                 ok -> ok;
                 {error, Fails} -> io:format("Message failed to send to: ~p~n", Fails)
             end,
@@ -123,7 +127,6 @@ backup(State) ->
 
 %% @doc Sends a message to a list of nodes, retrying a specified number of times
 %% for each node if no ack response is received.
-%% TODO: !! consider sending message to all nodes except current node here !!
 -spec send_msg(msg(), list(node()), integer()) -> ok | {error, list(node())}.
 send_msg(Msg, [Node], Retries) -> 
     Node ! {node(), Msg},
@@ -143,6 +146,13 @@ send_msg(Msg, Nodes, Retries) ->
         [] -> ok;
         _L -> {error, Fails}
     end.
+
+%% @doc Sends a message using send_msg to all nodes except itself, given a list 
+%% of nodes.
+send2others(Msg, Nodes, Retries) ->
+    Rest = lists:filter(fun(X) -> X /= node() end, Nodes),
+    send_msg(Msg, Rest, Retries).
+    
 
 %% @doc Sends an ack response back after a message is received and delivered,
 %% then runs the specified handler of the message. Should be called within a
