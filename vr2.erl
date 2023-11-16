@@ -3,18 +3,18 @@
 -export([start/1, send2others/3]).
 
 -record(state, {configuration,
-                        replica_number,
-                        view_number=0,
-                        status="normal",
-                        last_normal_view=0,
-                        op_number=0,
-                        log=[],
-                        commit_number=0,
-                        client_table=#{},
-                        start_vc_count=0,
-                        do_vc_count=0,
-                        max_vc_commit_number=0,
-                        max_do_vc_msg}).
+                replica_number,
+                view_number=0,
+                status="normal",
+                last_normal_view=0,
+                op_number=0,
+                log=[],
+                commit_number=0,
+                client_table=#{},
+                start_vc_count=0,
+                do_vc_count=0,
+                max_vc_commit_number=0,
+                    max_do_vc_msg}).
 -type state() :: #state{}.
 
 -record(commit, {view_number, commit_number}).
@@ -42,13 +42,13 @@
 %% =============================================================================
 %% Message handlers
 %% =============================================================================
-handle_start_viewchange(State, Msg) -> void.
+handle_start_viewchange(State, Msg) -> State.
 
-handle_do_viewchange(State, Msg) -> void.
+handle_do_viewchange(State, Msg) -> State.
 
-handle_commit(State, Msg) -> void.
+handle_commit(State, Msg) -> State.
 
-handle_start_view(State, Msg) -> void.
+handle_start_view(State, Msg) -> State.
 
 %% =============================================================================
 %% Exported functions
@@ -64,10 +64,12 @@ start(CfgFile) ->
     %% Set up initial cluster state
     I = lookup_node_index(node(), Content, 0),
     State = #state{configuration=Content, replica_number=I},
+    io:format("~p~n", [State]),
     %% Spawn execution loop, register process with same name as module
     register(?MODULE, spawn(fun() -> loop(State) end)).
 
 loop(State) ->
+    io:format("~p~n", [State]),
     I = State#state.replica_number,
     V = State#state.view_number,
     case {I, V} of
@@ -91,7 +93,9 @@ primary(State) ->
             receive_msg(From, DoVC, fun handle_do_viewchange/2, State);
         {From, StartV} when is_record(StartV, start_view) ->
             receive_msg(From, StartV, fun handle_start_view/2, State);
-        Unexpected -> io:format("unexpected message ~p~n", [Unexpected])            
+        Unexpected -> 
+            io:format("Unexpected message ~p~n", [Unexpected]),
+            State
     end.
     
 backup(State) ->
@@ -104,7 +108,9 @@ backup(State) ->
             receive_msg(From, DoVC, fun handle_do_viewchange/2, State);
         {From, StartV} when is_record(StartV, start_view) ->
             receive_msg(From, StartV, fun handle_start_view/2, State);
-        Unexpected -> io:format("unexpected message ~p~n", [Unexpected])            
+        Unexpected -> 
+            io:format("Unexpected message ~p~n", [Unexpected]),
+            State
     after
         1000 ->
             %% Send STARTVIEWCHANGE to all other replicas
@@ -129,6 +135,7 @@ backup(State) ->
 %% for each node if no ack response is received.
 -spec send_msg(msg(), list(node()), integer()) -> ok | {error, list(node())}.
 send_msg(Msg, [Node], Retries) -> 
+    %% Pass message to registered process on other node
     {?MODULE, Node} ! {node(), Msg},
     receive
         {From, ok} when From =:= Node -> ok
@@ -149,11 +156,6 @@ send_msg(Msg, Nodes, Retries) ->
 
 %% @doc Sends a message using send_msg to all nodes except itself, given a list 
 %% of nodes.
-%% TODO: It seems like you're slightly misunderstanding how message passing
-%% works, particularly across different nodes. Note that the node atom is NOT
-%% a PID, which is what we need for message passing. That's why you're getting
-%% an invalid destination error. Need to look into this and read about this 
-%% some more.
 -spec send2others(msg(), list(node()), integer()) -> ok | {error, list(node())}.
 send2others(Msg, Nodes, Retries) ->
     Rest = lists:filter(fun(X) -> X /= node() end, Nodes),
@@ -166,7 +168,7 @@ send2others(Msg, Nodes, Retries) ->
 -spec receive_msg(node(), msg(), fun((state(), msg()) -> state()), state()) -> state().
 receive_msg(From, Msg, Handler, State) ->
     %% Return message delivered ack to sending node
-    From ! {node(), ok},
+    {?MODULE, From} ! {node(), ok},
     %% Run handler using Msg and State
     Handler(State, Msg).
     
