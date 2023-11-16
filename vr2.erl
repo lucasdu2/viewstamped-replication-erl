@@ -64,8 +64,8 @@ start(CfgFile) ->
     %% Set up initial cluster state
     I = lookup_node_index(node(), Content, 0),
     State = #state{configuration=Content, replica_number=I},
-    %% Enter execution loop
-    loop(State).
+    %% Spawn execution loop, register process with same name as module
+    register(?MODULE, spawn(fun() -> loop(State) end)).
 
 loop(State) ->
     I = State#state.replica_number,
