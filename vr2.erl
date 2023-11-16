@@ -129,7 +129,7 @@ backup(State) ->
 %% for each node if no ack response is received.
 -spec send_msg(msg(), list(node()), integer()) -> ok | {error, list(node())}.
 send_msg(Msg, [Node], Retries) -> 
-    Node ! {node(), Msg},
+    {?MODULE, Node} ! {node(), Msg},
     receive
         {From, ok} when From =:= Node -> ok
     after 500 ->
