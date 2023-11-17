@@ -64,12 +64,10 @@ start(CfgFile) ->
     %% Set up initial cluster state
     I = lookup_node_index(node(), Content, 0),
     State = #state{configuration=Content, replica_number=I},
-    io:format("~p~n", [State]),
     %% Spawn execution loop, register process with same name as module
     register(?MODULE, spawn(fun() -> loop(State) end)).
 
 loop(State) ->
-    io:format("~p~n", [State]),
     I = State#state.replica_number,
     V = State#state.view_number,
     case {I, V} of
@@ -96,9 +94,18 @@ primary(State) ->
         Unexpected -> 
             io:format("Unexpected message ~p~n", [Unexpected]),
             State
+    after 
+        %% If no messages after brief interval, return current state and 
+        %% continue execution loop
+        200 -> 
+            State
     end.
     
 backup(State) ->
+    %% TODO: There is some incorrect behavior here. We only want the 1 second
+    %% timeout to be applied when we haven't gotten a communication from the 
+    %% primary, i.e. a commit message. We don't want any view change messsages
+    %% from other backups to reset the timeout timer. How do we fix this?
     receive
         {From, Commit} when is_record(Commit, commit) -> 
             receive_msg(From, Commit, fun handle_commit/2, State);
@@ -112,6 +119,8 @@ backup(State) ->
             io:format("Unexpected message ~p~n", [Unexpected]),
             State
     after
+        %% If no communication from primary after a specified timeout, start
+        %% view change protocol
         1000 ->
             %% Send STARTVIEWCHANGE to all other replicas
             V = State#state.view_number,
