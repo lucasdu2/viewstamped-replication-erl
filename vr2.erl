@@ -2,7 +2,8 @@
 -include_lib("eunit/include/eunit.hrl").
 -export([start/1, send2others/3]).
 
--record(state, {configuration,
+-record(state, {%% Below: state specified in paper
+                configuration,
                 replica_number,
                 view_number=0,
                 status="normal",
@@ -11,10 +12,11 @@
                 log=[],
                 commit_number=0,
                 client_table=#{},
+                %% Below: state needed for view change protocol
                 start_vc_count=0,
                 do_vc_count=0,
                 max_vc_commit_number=0,
-                    max_do_vc_msg}).
+                max_do_vc_msg}).
 -type state() :: #state{}.
 
 -record(commit, {view_number, commit_number}).
@@ -23,11 +25,11 @@
 -record(start_viewchange, {view_number, replica_number}).
 -type start_vc() :: #start_viewchange{}.
 
--record(do_viewchange, {view_number, 
-                        log, 
-                        last_normal_view, 
-                        op_number, 
-                        commit_number, 
+-record(do_viewchange, {view_number,
+                        log,
+                        last_normal_view,
+                        op_number,
+                        commit_number,
                         replica_number}).
 -type do_vc() :: #do_viewchange{}.
 
@@ -42,7 +44,34 @@
 %% =============================================================================
 %% Message handlers
 %% =============================================================================
-handle_start_viewchange(State, Msg) -> State.
+%% TODO: Look over this code, clean it up, write up docstring
+handle_start_viewchange(State, Msg) ->
+    #state{view_number = V, start_vc_count = Cnt} = State,
+    #start_viewchange{view_number = MsgV} = Msg,
+    case MsgV =:= V of
+        true ->
+            NewCnt = Cnt + 1,
+            case NewCnt =:= calculate_quorum(State) of
+                true ->
+                    %% Unpack fields from record
+                    #state{log = L, last_normal_view = NV, op_number = Op,
+                           commit_number = C, replica_number = I} = State,
+                    %% Send DOVIEWCHANGE to next primary
+                    DoVCMsg = #do_viewchange{view_number = V,
+                                             log = L,
+                                             last_normal_view = NV,
+                                             op_number = Op,
+                                             commit_number = C,
+                                             replica_number = I},
+                    NextPrimary = calculate_primary_from_view(State),
+                    send_msg(DoVCMsg, [NextPrimary], 3);
+                false -> void
+            end,
+            NewState = State#state{start_vc_count=NewCnt},
+            NewState;
+        _Else ->
+            State
+    end.
 
 handle_do_viewchange(State, Msg) -> State.
 
@@ -85,43 +114,30 @@ primary(State) ->
         {error, Fails} -> io:format("Message failed to send to: ~p~n", Fails)
     end,
     receive
-        {From, StartVC} when is_record(StartVC, start_viewchange) -> 
+        {From, StartVC} when is_record(StartVC, start_viewchange) ->
             receive_msg(From, StartVC, fun handle_start_viewchange/2, State);
-        {From, DoVC} when is_record(DoVC, do_viewchange) -> 
+        {From, DoVC} when is_record(DoVC, do_viewchange) ->
             receive_msg(From, DoVC, fun handle_do_viewchange/2, State);
         {From, StartV} when is_record(StartV, start_view) ->
             receive_msg(From, StartV, fun handle_start_view/2, State);
-        Unexpected -> 
-            io:format("Unexpected message ~p~n", [Unexpected]),
-            State
-    after 
-        %% If no messages after brief interval, return current state and 
-        %% continue execution loop
-        200 -> 
-            State
-    end.
-    
-backup(State) ->
-    %% TODO: There is some incorrect behavior here. We only want the 1 second
-    %% timeout to be applied when we haven't gotten a communication from the 
-    %% primary, i.e. a commit message. We don't want any view change messsages
-    %% from other backups to reset the timeout timer. How do we fix this?
-    receive
-        {From, Commit} when is_record(Commit, commit) -> 
-            receive_msg(From, Commit, fun handle_commit/2, State);
-        {From, StartVC} when is_record(StartVC, start_viewchange) -> 
-            receive_msg(From, StartVC, fun handle_start_viewchange/2, State);
-        {From, DoVC} when is_record(DoVC, do_viewchange) -> 
-            receive_msg(From, DoVC, fun handle_do_viewchange/2, State);
-        {From, StartV} when is_record(StartV, start_view) ->
-            receive_msg(From, StartV, fun handle_start_view/2, State);
-        Unexpected -> 
-            io:format("Unexpected message ~p~n", [Unexpected]),
+        Unexpected ->
+           io:format("Unexpected message ~p~n", [Unexpected]),
             State
     after
-        %% If no communication from primary after a specified timeout, start
-        %% view change protocol
-        1000 ->
+        %% If no messages after brief interval, return current state and
+        %% continue execution loop
+        200 ->
+            State
+    end.
+
+backup(State) ->
+    %% If no communication from primary after a specified timeout, start view
+    %% change protocol
+    NewState = receive
+        {Primary, Commit} when is_record(Commit, commit) ->
+            receive_msg(Primary, Commit, fun handle_commit/2, State)
+    after
+      1000 ->
             %% Send STARTVIEWCHANGE to all other replicas
             V = State#state.view_number,
             I = State#state.replica_number,
@@ -129,10 +145,22 @@ backup(State) ->
             Cfg = State#state.configuration,
             case send2others(Msg, Cfg, 3) of
                 ok -> ok;
-                {error, Fails} -> io:format("Message failed to send to: ~p~n", Fails)
+                {eror, Fails} -> io:format("Message failed to send to: ~p~n", Fails)
             end,
             %% Update and return new state
-            NewState = State#state{view_number=V+1, status="view-change"},
+            ViewChangeState = State#state{view_number=V+1, status="view-change"},
+            ViewChangeState
+    end,
+    %% Handle view change protocol messages
+    receive
+        {From, StartVC} when is_record(StartVC, start_viewchange) ->
+            receive_msg(From, StartVC, fun handle_start_viewchange/2, NewState);
+        {From, DoVC} when is_record(DoVC, do_viewchange) ->
+            receive_msg(From, DoVC, fun handle_do_viewchange/2, NewState);
+        {From, StartV} when is_record(StartV, start_view) ->
+            receive_msg(From, StartV, fun handle_start_view/2, NewState);
+        Unexpected ->
+            io:format("Unexpected message ~p~n", [Unexpected]),
             NewState
     end.
 
@@ -143,7 +171,7 @@ backup(State) ->
 %% @doc Sends a message to a list of nodes, retrying a specified number of times
 %% for each node if no ack response is received.
 -spec send_msg(msg(), list(node()), integer()) -> ok | {error, list(node())}.
-send_msg(Msg, [Node], Retries) -> 
+send_msg(Msg, [Node], Retries) ->
     %% Pass message to registered process on other node
     {?MODULE, Node} ! {node(), Msg},
     receive
@@ -163,13 +191,13 @@ send_msg(Msg, Nodes, Retries) ->
         _L -> {error, Fails}
     end.
 
-%% @doc Sends a message using send_msg to all nodes except itself, given a list 
+%% @doc Sends a message using send_msg to all nodes except itself, given a list
 %% of nodes.
 -spec send2others(msg(), list(node()), integer()) -> ok | {error, list(node())}.
 send2others(Msg, Nodes, Retries) ->
     Rest = lists:filter(fun(X) -> X /= node() end, Nodes),
     send_msg(Msg, Rest, Retries).
-    
+
 
 %% @doc Sends an ack response back after a message is received and delivered,
 %% then runs the specified handler of the message. Should be called within a
@@ -180,17 +208,17 @@ receive_msg(From, Msg, Handler, State) ->
     {?MODULE, From} ! {node(), ok},
     %% Run handler using Msg and State
     Handler(State, Msg).
-    
+
 
 %% =============================================================================
 %% Internal functions
 %% =============================================================================
 
 %% @doc Loads an initial configuration from a local file.
-load_config(File) -> 
+load_config(File) ->
     {Ret, Content} = file:read_file(File),
     case Ret of
-        ok -> 
+        ok ->
             SplitBin = binary:split(Content, <<"\n">>, [global]),
             SortBin = lists:sort(SplitBin),
             SortedCfg = lists:map(fun(Bin) -> binary_to_atom(Bin) end, SortBin),
@@ -208,3 +236,13 @@ lookup_node_index_test() ->
     TestCfg = [node1, node2, node3, node4, node5],
     ?assertEqual(0, lookup_node_index(node1, TestCfg, 0)),
     ?assertEqual(3, lookup_node_index(node4, TestCfg, 0)).
+
+%% TODO: Write up docstrings for these function, do some basic tests
+calculate_primary_from_view(State) ->
+    #state{configuration = Cfg, view_number = V} = State,
+    TotalReplicas = erlang:length(Cfg),
+    PrimaryI = V rem TotalReplicas,
+    lists:nth(PrimaryI, Cfg).
+
+calculate_quorum(State) ->
+    erlang:length(State#state.configuration) div 2 + 1.
