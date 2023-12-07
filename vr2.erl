@@ -16,7 +16,9 @@
                 start_vc_count=0,
                 do_vc_count=0,
                 max_vc_commit_number=0,
-                max_do_vc_msg}).
+                max_do_vc_msg,
+                %% Below: state needed for protocol message deduplication
+                start_vc_cache=#{}}).
 -type state() :: #state{}.
 
 -record(commit, {view_number, commit_number}).
@@ -44,34 +46,51 @@
 %% =============================================================================
 %% Message handlers
 %% =============================================================================
-%% TODO: Look over this code, clean it up, write up docstring
-handle_start_viewchange(State, Msg) ->
-    #state{view_number = V, start_vc_count = Cnt} = State,
-    #start_viewchange{view_number = MsgV} = Msg,
-    case MsgV =:= V of
-        true ->
+
+build_do_viewchange(State) ->
+    #state{view_number = V,
+           log = L,
+           last_normal_view = NV,
+           op_number = Op,
+           commit_number = C,
+           replica_number = I} = State,
+    #do_viewchange{view_number = V,
+                   log = L,
+                   last_normal_view = NV,
+                   op_number = Op,
+                   commit_number = C,
+                   replica_number = I}.
+
+send_do_viewchange(C, Q, State) when C =:= Q ->
+    DoVCMsg = build_do_viewchange(State),
+    NextPrimary = calculate_primary_from_view(State),
+    send_msg(DoVCMsg, [NextPrimary], 3);
+send_do_viewchange(_, _, _) -> void.
+
+%% @doc: TODO (and spec for this function and above functions)
+process_start_viewchange(StateV, MsgV, State, Msg) when StateV =:= MsgV ->
+    #state{start_vc_count = Cnt, start_vc_cache = MsgCache} = State,
+    #do_viewchange{replica_number = MsgI} = Msg,
+    %% Only process non-duplicate messages
+    case maps:find(MsgI, MsgCache) of
+        {ok, _} ->
+            %% Increment message counter
             NewCnt = Cnt + 1,
-            case NewCnt =:= calculate_quorum(State) of
-                true ->
-                    %% Unpack fields from record
-                    #state{log = L, last_normal_view = NV, op_number = Op,
-                           commit_number = C, replica_number = I} = State,
-                    %% Send DOVIEWCHANGE to next primary
-                    DoVCMsg = #do_viewchange{view_number = V,
-                                             log = L,
-                                             last_normal_view = NV,
-                                             op_number = Op,
-                                             commit_number = C,
-                                             replica_number = I},
-                    NextPrimary = calculate_primary_from_view(State),
-                    send_msg(DoVCMsg, [NextPrimary], 3);
-                false -> void
-            end,
-            NewState = State#state{start_vc_count=NewCnt},
+            NewState = State#state{start_vc_count = NewCnt},
+            %% TODO: Add message to the cache
+            Quorum = calculate_quorum(NewState),
+            send_do_viewchange(NewCnt, Quorum, NewState),
             NewState;
-        _Else ->
-            State
-    end.
+        error -> State
+    end;
+process_start_viewchange(_, _, State, _) ->
+    State.
+
+handle_start_viewchange(State, Msg) ->
+    #state{view_number = StateV} = State,
+    #start_viewchange{view_number = MsgV} = Msg,
+    %% Process message when view numbers match, do nothing otherwise
+    process_start_viewchange(StateV, MsgV, State, Msg).
 
 handle_do_viewchange(State, Msg) -> State.
 
@@ -92,7 +111,10 @@ start(CfgFile) ->
     end,
     %% Set up initial cluster state
     I = lookup_node_index(node(), Content, 0),
-    State = #state{configuration=Content, replica_number=I},
+    State = #state{configuration=Content,
+                   replica_number=I,
+                   client_table=maps:new(),
+                   start_vc_cache=maps:new()},
     %% Spawn execution loop, register process with same name as module
     register(?MODULE, spawn(fun() -> loop(State) end)).
 
@@ -237,12 +259,27 @@ lookup_node_index_test() ->
     ?assertEqual(0, lookup_node_index(node1, TestCfg, 0)),
     ?assertEqual(3, lookup_node_index(node4, TestCfg, 0)).
 
-%% TODO: Write up docstrings for these function, do some basic tests
+%% @doc Modification of lists:nth/2 that is 0-indexed instead of 1-indexed.
+nth0index(0, [H|_]) -> H;
+nth0index(N, [_|T]) when N > 0 ->
+    nth0index(N - 1, T).
+
+%% @doc Finds the name of primary node associated with a view number.
 calculate_primary_from_view(State) ->
     #state{configuration = Cfg, view_number = V} = State,
     TotalReplicas = erlang:length(Cfg),
     PrimaryI = V rem TotalReplicas,
-    lists:nth(PrimaryI, Cfg).
+    nth0index(PrimaryI, Cfg).
 
+calculate_primary_from_view_test() ->
+    TestState = #state{configuration = [node1, node2, node3], view_number = 1},
+    ?assertEqual(node2, calculate_primary_from_view(TestState)).
+
+%% @doc Calculates the quorum of the system (a majority of the total number of
+%% nodes in the system).
 calculate_quorum(State) ->
     erlang:length(State#state.configuration) div 2 + 1.
+
+calculate_quorum_test() ->
+    TestState = #state{configuration = [n1, n2, n3, n4, n5, n6, n7]},
+    ?assertEqual(4, calculate_quorum(TestState)).

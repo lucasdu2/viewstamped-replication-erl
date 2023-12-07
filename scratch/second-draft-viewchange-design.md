@@ -61,6 +61,7 @@ cache, if we want to call it that) once its contents are no longer needed. For
 example, all messages related to view changes can be discarded once a view
 change is completed, since the protocol will already (I think) reject future 
 messages related to a past view change. 
+- For more performance, we can index these maps by replica number.
 
 ## Development plan
 - Write code and test in small increments. Once tests pass and you're reasonably
