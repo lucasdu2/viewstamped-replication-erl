@@ -11,14 +11,14 @@
                 op_number=0,
                 log=[],
                 commit_number=0,
-                client_table=#{},
+                client_table=maps:new(),
                 %% Below: state needed for view change protocol
                 start_vc_count=0,
                 do_vc_count=0,
                 max_vc_commit_number=0,
                 max_do_vc_msg,
                 %% Below: state needed for protocol message deduplication
-                start_vc_cache=#{}}).
+                start_vc_cache=sets:new()}).
 -type state() :: #state{}.
 
 -record(commit, {view_number, commit_number}).
@@ -61,31 +61,34 @@ build_do_viewchange(State) ->
                    commit_number = C,
                    replica_number = I}.
 
-send_do_viewchange(C, Q, State) when C =:= Q ->
+send_do_viewchange(C, Q, State) when C >= Q ->
     DoVCMsg = build_do_viewchange(State),
     NextPrimary = calculate_primary_from_view(State),
     send_msg(DoVCMsg, [NextPrimary], 3);
 send_do_viewchange(_, _, _) -> void.
 
-%% @doc: TODO (and spec for this function and above functions)
+%% @doc: Processes STARTVIEWCHANGE message when view numbers match
 process_start_viewchange(StateV, MsgV, State, Msg) when StateV =:= MsgV ->
     #state{start_vc_count = Cnt, start_vc_cache = MsgCache} = State,
     #do_viewchange{replica_number = MsgI} = Msg,
-    %% Only process non-duplicate messages
-    case maps:find(MsgI, MsgCache) of
-        {ok, _} ->
+    %% Skip duplicate messages (i.e. messages from the same replica)
+    case sets:is_element(MsgI, MsgCache) of
+        true -> State;
+        false ->
             %% Increment message counter
             NewCnt = Cnt + 1,
-            NewState = State#state{start_vc_count = NewCnt},
-            %% TODO: Add message to the cache
+            %% Add message replica number to cache
+            NewCache = sets:add_element(MsgI, MsgCache),
+            NewState = State#state{start_vc_count = NewCnt, start_vc_cache = NewCache},
             Quorum = calculate_quorum(NewState),
+            %% Send DOVIEWCHANGE message when quorum is reached
             send_do_viewchange(NewCnt, Quorum, NewState),
-            NewState;
-        error -> State
+            NewState
     end;
 process_start_viewchange(_, _, State, _) ->
     State.
 
+%% @doc: Handles STARVIEWCHANGE messages sent to a replica.
 handle_start_viewchange(State, Msg) ->
     #state{view_number = StateV} = State,
     #start_viewchange{view_number = MsgV} = Msg,
@@ -161,17 +164,20 @@ backup(State) ->
     after
       1000 ->
             %% Send STARTVIEWCHANGE to all other replicas
-            V = State#state.view_number,
+            NewV = State#state.view_number,
             I = State#state.replica_number,
-            Msg = #start_viewchange{view_number=V+1, replica_number=I},
+            %% Increment local STARTVIEWCHANGE message counter
+            NewCnt = State#state.start_vc_count + 1,
+            Msg = #start_viewchange{view_number=NewV, replica_number=I},
             Cfg = State#state.configuration,
             case send2others(Msg, Cfg, 3) of
                 ok -> ok;
                 {eror, Fails} -> io:format("Message failed to send to: ~p~n", Fails)
             end,
             %% Update and return new state
-            ViewChangeState = State#state{view_number=V+1, status="view-change"},
-            ViewChangeState
+            State#state{view_number=NewV,
+                        status="view-change",
+                        start_vc_count=NewCnt}
     end,
     %% Handle view change protocol messages
     receive
