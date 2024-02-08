@@ -185,6 +185,7 @@ handle_start_view(State, StartV) ->
     %%   that there are uncommitted operations in the log and should enter that protocol.
     %% - then, somehow, we have to determine what operations haven't been executed...
     NewState.
+
 %% =============================================================================
 %% Main execution loop
 %% =============================================================================
