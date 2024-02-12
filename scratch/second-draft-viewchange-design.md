@@ -64,6 +64,12 @@ can clear each set (or each cache, if we want to call it that) once its contents
 are no longer needed. For example, all messages related to view changes can be
 discarded once a view change is completed, since the protocol will already
 (I think) reject future messages related to a past view change.
+- NOTE: Don't forget to clear the caches when they are no longer needed. There
+are a couple choices for where you can do this:
+    1) Immediately after the quorum for that type of message is reached and the
+    next part of the protocol begins
+    2) At the end of the view change protocol, when the replica receives a
+    STARTVIEW message
 
 ## Development plan
 - Write code and test in small increments. Once tests pass and you're reasonably
