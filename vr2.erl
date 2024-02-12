@@ -44,8 +44,57 @@
 -type msg() :: norm_msg() | vc_msg().
 
 %% =============================================================================
-%% Message handlers
+%% Message handlers and senders
 %% =============================================================================
+
+send_commit(State) ->
+    V = State#state.view_number,
+    Commit = State#state.commit_number,
+    Msg = #commit{view_number=V, commit_number=Commit},
+    Cfg = State#state.configuration,
+    case send2others(Msg, Cfg, 3) of
+        ok -> ok;
+        {error, Fails} -> io:format("Message failed to send to: ~p~n", Fails)
+    end.
+
+handle_commit(State, Msg) ->
+    %% Set status and view number to ones given in message; reset STARTVIEWCHANGE
+    %% message counter and cache
+    %% NOTE: This handles the case where a replica enters the view-change
+    %% protocol, but then reconnects with the primary
+    State#state{status         = "normal",
+                view_number    = Msg#commit.view_number,
+                commit_number  = Msg#commit.commit_number,
+                start_vc_count = 0,
+                start_vc_cache = sets:new()}.
+
+send_start_viewchange(State) ->
+    V = State#state.view_number,
+    I = State#state.replica_number,
+    Cfg = State#state.configuration,
+    case State#state.status of
+        "normal" ->
+            %% Increment view number
+            NewV = V + 1,
+            %% Increment local STARTVIEWCHANGE message counter
+            NewCnt = State#state.start_vc_count + 1,
+            Msg = #start_viewchange{view_number=NewV, replica_number=I},
+            %% Update state
+            NewState = State#state{view_number=NewV,
+                                   status="view-change",
+                                   start_vc_count=NewCnt};
+        "view-change" ->
+            Msg = #start_viewchange{view_number=V, replica_number=I},
+            %% Retain current state
+            NewState = State
+    end,
+    %% Send STARTVIEWCHANGE message to other replicas
+    case send2others(Msg, Cfg, 3) of
+        ok -> ok;
+        {error, Fails} ->
+            io:format("Message failed to send to: ~p~n", Fails)
+    end,
+    NewState.
 
 build_do_viewchange(State) ->
     #state{view_number = V,
@@ -97,12 +146,10 @@ handle_start_viewchange(State, Msg) ->
 
 handle_do_viewchange(State, Msg) -> State.
 
-handle_commit(State, Msg) -> State.
-
 handle_start_view(State, Msg) -> State.
 
 %% =============================================================================
-%% Exported functions
+%% Exported functions, main execution loop
 %% =============================================================================
 
 start(CfgFile) ->
@@ -130,14 +177,9 @@ loop(State) ->
     end.
 
 primary(State) ->
-    V = State#state.view_number,
-    Commit = State#state.commit_number,
-    Msg = #commit{view_number=V, commit_number=Commit},
-    Cfg = State#state.configuration,
-    case send2others(Msg, Cfg, 3) of
-        ok -> ok;
-        {error, Fails} -> io:format("Message failed to send to: ~p~n", Fails)
-    end,
+    %% Send commit message to all backup replicas
+    send_commit(State),
+    %% Handle view change protocol messages
     receive
         {From, StartVC} when is_record(StartVC, start_viewchange) ->
             receive_msg(From, StartVC, fun handle_start_viewchange/2, State);
@@ -146,13 +188,11 @@ primary(State) ->
         {From, StartV} when is_record(StartV, start_view) ->
             receive_msg(From, StartV, fun handle_start_view/2, State);
         Unexpected ->
-           io:format("Unexpected message ~p~n", [Unexpected]),
+           io:format("Unexpected message on primary ~p~n", [Unexpected]),
             State
     after
-        %% If no messages after brief interval, return current state and
-        %% continue execution loop
-        200 ->
-            State
+        %% If no messages after brief interval, return state to continue
+        200 -> State
     end.
 
 backup(State) ->
@@ -162,22 +202,8 @@ backup(State) ->
         {Primary, Commit} when is_record(Commit, commit) ->
             receive_msg(Primary, Commit, fun handle_commit/2, State)
     after
-      1000 ->
-            %% Send STARTVIEWCHANGE to all other replicas
-            NewV = State#state.view_number,
-            I = State#state.replica_number,
-            %% Increment local STARTVIEWCHANGE message counter
-            NewCnt = State#state.start_vc_count + 1,
-            Msg = #start_viewchange{view_number=NewV, replica_number=I},
-            Cfg = State#state.configuration,
-            case send2others(Msg, Cfg, 3) of
-                ok -> ok;
-                {eror, Fails} -> io:format("Message failed to send to: ~p~n", Fails)
-            end,
-            %% Update and return new state
-            State#state{view_number=NewV,
-                        status="view-change",
-                        start_vc_count=NewCnt}
+        %% Send STARTVIEWCHANGE to all other replicas
+        1000 -> send_start_viewchange(State)
     end,
     %% Handle view change protocol messages
     receive
@@ -188,7 +214,7 @@ backup(State) ->
         {From, StartV} when is_record(StartV, start_view) ->
             receive_msg(From, StartV, fun handle_start_view/2, NewState);
         Unexpected ->
-            io:format("Unexpected message ~p~n", [Unexpected]),
+            io:format("Unexpected message on backup ~p~n", [Unexpected]),
             NewState
     end.
 
