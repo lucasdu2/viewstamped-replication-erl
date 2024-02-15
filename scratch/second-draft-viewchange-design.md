@@ -70,6 +70,7 @@ are a couple choices for where you can do this:
     next part of the protocol begins
     2) At the end of the view change protocol, when the replica receives a
     STARTVIEW message
+- Generally, think about where you need to reset caches in the execution flow.
 
 ## Development plan
 - Write code and test in small increments. Once tests pass and you're reasonably

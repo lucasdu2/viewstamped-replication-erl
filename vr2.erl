@@ -18,7 +18,8 @@
                 max_vc_commit_number=0,
                 max_do_vc_msg,
                 %% Below: state needed for protocol message deduplication
-                start_vc_cache=sets:new()}).
+                start_vc_cache=sets:new(),
+                do_vc_cache=sets:new()}).
 -type state() :: #state{}.
 
 -record(commit, {view_number, commit_number}).
@@ -113,13 +114,17 @@ build_do_viewchange(State) ->
 send_do_viewchange(C, Q, State) when C >= Q ->
     DoVCMsg = build_do_viewchange(State),
     NextPrimary = calculate_primary_from_view(State),
+    %% TODO: Do we need to reset the relevant metadata for STARTVIEWCHANGE
+    %% messages here?
+    %% TODO: Also, should we handle errors from send_msg in the same way that
+    %% we handle errors from send2others?
     send_msg(DoVCMsg, [NextPrimary], 3);
 send_do_viewchange(_, _, _) -> void.
 
 %% @doc: Processes STARTVIEWCHANGE message when view numbers match
 process_start_viewchange(StateV, MsgV, State, Msg) when StateV =:= MsgV ->
     #state{start_vc_count = Cnt, start_vc_cache = MsgCache} = State,
-    #do_viewchange{replica_number = MsgI} = Msg,
+    #start_viewchange{replica_number = MsgI} = Msg,
     %% Skip duplicate messages (i.e. messages from the same replica)
     case sets:is_element(MsgI, MsgCache) of
         true -> State;
@@ -134,17 +139,96 @@ process_start_viewchange(StateV, MsgV, State, Msg) when StateV =:= MsgV ->
             send_do_viewchange(NewCnt, Quorum, NewState),
             NewState
     end;
-process_start_viewchange(_, _, State, _) ->
-    State.
+process_start_viewchange(_, _, State, _) -> State.
 
-%% @doc: Handles STARVIEWCHANGE messages sent to a replica.
+%% @doc: Handles STARTVIEWCHANGE messages sent to a replica.
 handle_start_viewchange(State, Msg) ->
     #state{view_number = StateV} = State,
     #start_viewchange{view_number = MsgV} = Msg,
     %% Process message when view numbers match, do nothing otherwise
     process_start_viewchange(StateV, MsgV, State, Msg).
 
-handle_do_viewchange(State, Msg) -> State.
+send_start_view(C, Q, State) when C >= Q ->
+    %% Update state, clear view change metadata
+    MaxDoVC   = State#state.max_do_vc_msg,
+    NewV      = MaxDoVC#do_viewchange.view_number,
+    NewLog    = MaxDoVC#do_viewchange.log,
+    %% TODO: Think about if this is an appropriate way to get the new op number
+    %% or if we really need to go into the log itself to get it.
+    NewOp     = MaxDoVC#do_viewchange.op_number,
+    MaxCommit = State#state.max_vc_commit_number,
+    NewState = State#state{view_number   = NewV,
+                           log           = NewLog,
+                           op_number     = NewOp,
+                           commit_number = MaxCommit,
+                           status        = "normal",
+                           %% Clear relevant view change metadata
+                           do_vc_count          = 0,
+                           max_vc_commit_number = 0,
+                           max_do_vc_msg        = #do_viewchange{},
+                           do_vc_cache          = sets:new()},
+    Msg = #start_view{view_number   = NewV,
+                      log           = NewLog,
+                      op_number     = NewOp,
+                      commit_number = MaxCommit},
+    Cfg = State#state.configuration,
+    case send2others(Msg, Cfg, 3) of
+        ok -> ok;
+        {error, Fails} ->
+            io:format("Message failed to send to: ~p~n", Fails)
+    end,
+    NewState;
+send_start_view(_, _, State) -> State.
+
+compare_commit_numbers(NewDoVC, State) ->
+    NewCommit = NewDoVC#do_viewchange.commit_number,
+    MaxCommit = State#state.max_vc_commit_number,
+    compare_take_larger(NewCommit, MaxCommit).
+
+compare_do_viewchanges(NewDoVC, State) ->
+    MaxDoVC = State#state.max_do_vc_msg,
+    MaxNormal = MaxDoVC#do_viewchange.last_normal_view,
+    case NewDoVC#do_viewchange.last_normal_view of
+        NewNormal when NewNormal > MaxNormal   -> NewDoVC;
+        NewNormal when NewNormal =:= MaxNormal ->
+            N1 = NewDoVC#do_viewchange.op_number,
+            N2 = MaxDoVC#do_viewchange.op_number,
+            case N1 > N2 of
+                true  -> NewDoVC;
+                false -> MaxDoVC
+            end;
+        _ -> MaxDoVC
+    end.
+
+process_do_viewchange(StateV, MsgV, State, Msg) when MsgV >= StateV ->
+    #state{do_vc_count = Cnt, do_vc_cache = MsgCache} = State,
+    #do_viewchange{replica_number = MsgI} = Msg,
+    %% Skip duplicate messages (i.e. messages from the same replica)
+    case sets:is_element(MsgI, MsgCache) of
+        true -> State;
+        false ->
+            %% Increment message counter
+            NewCnt = Cnt + 1,
+            %% Add message replica number to cache
+            NewCache = sets:add_element(MsgI, MsgCache),
+            %% Update state with necessary view change metadata
+            NewState = State#state{
+                         do_vc_count          = NewCnt,
+                         do_vc_cache          = NewCache,
+                         max_vc_commit_number = compare_commit_numbers(Msg, State),
+                         max_do_vc_msg        = compare_do_viewchanges(Msg, State)
+                        },
+            Quorum = calculate_quorum(NewState),
+            %% Send STARTVIEW message when quorum is reached
+            send_start_view(NewCnt, Quorum, NewState),
+            NewState
+    end;
+process_do_viewchange(_, _, State, _) -> State.
+
+handle_do_viewchange(State, Msg) ->
+    #state{view_number = StateV} = State,
+    #start_viewchange{view_number = MsgV} = Msg,
+    process_do_viewchange(StateV, MsgV, State, Msg).
 
 handle_start_view(State, Msg) -> State.
 
@@ -265,7 +349,7 @@ receive_msg(From, Msg, Handler, State) ->
 
 
 %% =============================================================================
-%% Internal functions
+%% Internal helper functions
 %% =============================================================================
 
 %% @doc Loads an initial configuration from a local file.
@@ -315,3 +399,6 @@ calculate_quorum(State) ->
 calculate_quorum_test() ->
     TestState = #state{configuration = [n1, n2, n3, n4, n5, n6, n7]},
     ?assertEqual(4, calculate_quorum(TestState)).
+
+compare_take_larger(A, B) when A > B -> A;
+compare_take_larger(_, B) -> B.
