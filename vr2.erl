@@ -114,11 +114,19 @@ build_do_viewchange(State) ->
 send_do_viewchange(C, Q, State) when C >= Q ->
     DoVCMsg = build_do_viewchange(State),
     NextPrimary = calculate_primary_from_view(State),
-    %% TODO: Do we need to reset the relevant metadata for STARTVIEWCHANGE
-    %% messages here?
-    %% TODO: Also, should we handle errors from send_msg in the same way that
-    %% we handle errors from send2others?
-    send_msg(DoVCMsg, [NextPrimary], 3);
+    case send_msg(DoVCMsg, [NextPrimary], 3) of
+        ok -> ok;
+        {error, _} ->
+            io:format("Message failed to send to: ~p~n", NextPrimary)
+    end,
+    %% Reset STARTVIEWCHANGE counter and message cache
+    %% NOTE: If we don't reset here after sending a DOVIEWCHANGE message, we
+    %% will only stop sending DOVIEWCHANGE messages when a view change actually
+    %% completes and we do a reset there. Since replicas can reconnect, the
+    %% completion of a view change at this point in the protocol is not
+    %% guaranteed--we do not want to send DOVIEWCHANGE messages indefinitely.
+    State#state{start_vc_count = 0,
+                start_vc_cache = sets:new()};
 send_do_viewchange(_, _, _) -> void.
 
 %% @doc: Processes STARTVIEWCHANGE message when view numbers match
@@ -153,8 +161,11 @@ send_start_view(C, Q, State) when C >= Q ->
     MaxDoVC   = State#state.max_do_vc_msg,
     NewV      = MaxDoVC#do_viewchange.view_number,
     NewLog    = MaxDoVC#do_viewchange.log,
-    %% TODO: Think about if this is an appropriate way to get the new op number
-    %% or if we really need to go into the log itself to get it.
+    %% NOTE: Since, in our Erlang implementation, every action within a replica
+    %% should be serial, we can just directly get the new op number from the
+    %% message itself (instead of having to get it from the log). There should
+    %% be no risk that the max op number in the log and the op number in the
+    %% message are de-synced.
     NewOp     = MaxDoVC#do_viewchange.op_number,
     MaxCommit = State#state.max_vc_commit_number,
     NewState = State#state{view_number   = NewV,
