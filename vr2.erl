@@ -127,7 +127,7 @@ send_do_viewchange(C, Q, State) when C >= Q ->
     %% guaranteed--we do not want to send DOVIEWCHANGE messages indefinitely.
     State#state{start_vc_count = 0,
                 start_vc_cache = sets:new()};
-send_do_viewchange(_, _, _) -> void.
+send_do_viewchange(_, _, State) -> State.
 
 %% @doc: Processes STARTVIEWCHANGE message when view numbers match
 process_start_viewchange(StateV, MsgV, State, Msg) when StateV =:= MsgV ->

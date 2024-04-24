@@ -71,6 +71,13 @@ are a couple choices for where you can do this:
     2) At the end of the view change protocol, when the replica receives a
     STARTVIEW message
 - Generally, think about where you need to reset caches in the execution flow.
+- After some thought: should do it immediately after the quorum is reached and
+also do it at the end of the view change protocol (when STARTVIEW message is
+received). Message counters for quorum should also be reset at these points.
+I think this keeps things simpler to reason about. The only thing driving the
+view change protocol state machine would be disconnected replicas repeatedly
+sending STARTVIEWCHANGE messages--all other stages of the protocol would only
+generate "one shot" messages to the next stage.
 
 ## Development plan
 - Write code and test in small increments. Once tests pass and you're reasonably
