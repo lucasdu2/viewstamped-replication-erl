@@ -40,3 +40,19 @@ service-defined structures as parameters to our functions
 We also need to imagine importing the VR module into another program--the
 service program--so we may need to rethink what functions we want to export
 for the service program to have access to.
+
+## Some things to consider
+- Possibly have one VR server on the same node as each KV server
+- KV client communicates with KV server, KV server communicates with VR server
+in order to do the replication
+- KV server takes client request, passes it to VR server for log replication;
+once request is committed to the VR log, VR server communicates this with the
+KV server, KV server actually executes the operation
+- One difficulty: clients always need to be communicating with the primary
+server from VR's perspective
+    - how can we get this to work with a gen_server setup? is it even possible?
+    - we need to have some kind of upcall mechanism to communicate primary
+    changes to the client
+    - the other possibility is having a stable name for the server that clients
+    can always communicate with and that does the request routing to the primary
+    behind the scenes--but unsure if this is possible with Erlang/BEAM
