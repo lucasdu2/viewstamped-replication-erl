@@ -1,6 +1,6 @@
 -module(vr2).
 -include_lib("eunit/include/eunit.hrl").
--export([start/1, send2others/3]).
+-export([start/3, send2others/3]).
 
 -record(state, {%% Below: state specified in paper
                 configuration,
@@ -19,7 +19,9 @@
                 max_do_vc_msg,
                 %% Below: state needed for protocol message deduplication
                 start_vc_cache=sets:new(),
-                do_vc_cache=sets:new()}).
+                do_vc_cache=sets:new(),
+                %% Below: service module name
+                service_module}).
 -type state() :: #state{}.
 
 -record(commit, {view_number, commit_number}).
@@ -144,8 +146,7 @@ process_start_viewchange(StateV, MsgV, State, Msg) when StateV =:= MsgV ->
             NewState = State#state{start_vc_count = NewCnt, start_vc_cache = NewCache},
             Quorum = calculate_quorum(NewState),
             %% Send DOVIEWCHANGE message when quorum is reached
-            send_do_viewchange(NewCnt, Quorum, NewState),
-            NewState
+            send_do_viewchange(NewCnt, Quorum, NewState)
     end;
 process_start_viewchange(_, _, State, _) -> State.
 
@@ -188,7 +189,7 @@ send_start_view(C, Q, State) when C >= Q ->
         {error, Fails} ->
             io:format("Message failed to send to: ~p~n", Fails)
     end,
-    NewState;
+    handle_unexecuted_committed(State, NewState);
 send_start_view(_, _, State) -> State.
 
 compare_commit_numbers(NewDoVC, State) ->
@@ -228,7 +229,7 @@ process_do_viewchange(StateV, MsgV, State, Msg) when MsgV >= StateV ->
                          do_vc_cache          = NewCache,
                          max_vc_commit_number = compare_commit_numbers(Msg, State),
                          max_do_vc_msg        = compare_do_viewchanges(Msg, State)
-                        },
+                       },
             Quorum = calculate_quorum(NewState),
             %% Send STARTVIEW message when quorum is reached
             send_start_view(NewCnt, Quorum, NewState),
@@ -241,27 +242,58 @@ handle_do_viewchange(State, Msg) ->
     #start_viewchange{view_number = MsgV} = Msg,
     process_do_viewchange(StateV, MsgV, State, Msg).
 
-handle_start_view(State, Msg) -> State.
+handle_start_view(State, Msg) ->
+    State.
+
+%% @doc After a STARTVIEW message is sent to initiate a new view, both the new
+%% primary and new backups need to perform some state updates in order to make
+%% sure everything (log, client table, actual on-replica data--i.e. a key-value
+%% store we are replicating with VR) are properly synchronized.
+handle_unexecuted_committed(LocalState, LatestState) ->
+    LocalCommit = LocalState#state.commit_number,
+    LatestCommit = LatestState#state.commit_number,
+    %% Execute all missing commits locally, updating client table
+
+    %% If primary, send corresponding replies to clients
+    LatestState.
 
 %% =============================================================================
 %% Exported functions, main execution loop
 %% =============================================================================
 
-start(CfgFile) ->
-    %% Load initial cluster configuration
-    {Ret, Content} = load_config(CfgFile),
-    case Ret of
-        ok -> io:format("Read configuration: ~p~n", [Content]);
-        error -> error(Content)
-    end,
+-spec start(list(atom()), atom(), list()) -> ok.
+start(Cfg, SvcMod, SvcInitArgs) ->
+    %% Sort cluster configuration in a deterministic way
+    SortCfg = lists:sort(Cfg),
     %% Set up initial cluster state
-    I = lookup_node_index(node(), Content, 0),
-    State = #state{configuration=Content,
+    I = lookup_node_index(node(), SortCfg, 0),
+    State = #state{configuration=SortCfg,
                    replica_number=I,
                    client_table=maps:new(),
-                   start_vc_cache=maps:new()},
+                   start_vc_cache=maps:new(),
+                   service_module=SvcMod},
+    %% Spawn service code server
+    register(SvcMod,
+             spawn(fun() -> loop_service(SvcMod,
+                                         SvcMod:init(SvcInitArgs)) end)),
     %% Spawn execution loop, register process with same name as module
-    register(?MODULE, spawn(fun() -> loop(State) end)).
+    register(?MODULE, spawn(fun() -> loop(State) end)),
+    ok.
+
+%% General purpose execution loop for service code server
+loop_service(SvcMod, OldState) ->
+    receive
+        {From, Request} ->
+            try SvcMod:handle(Request, OldState) of
+                {Response, NewState} ->
+                    From ! {ok, Response},
+                    loop_service(SvcMod, NewState)
+            catch
+                _: Why ->
+                    From ! {crash, Why},
+                    loop_service(SvcMod, OldState)
+            end
+    end.
 
 loop(State) ->
     I = State#state.replica_number,
@@ -347,7 +379,6 @@ send2others(Msg, Nodes, Retries) ->
     Rest = lists:filter(fun(X) -> X /= node() end, Nodes),
     send_msg(Msg, Rest, Retries).
 
-
 %% @doc Sends an ack response back after a message is received and delivered,
 %% then runs the specified handler of the message. Should be called within a
 %% receive block.
@@ -357,7 +388,6 @@ receive_msg(From, Msg, Handler, State) ->
     {?MODULE, From} ! {node(), ok},
     %% Run handler using Msg and State
     Handler(State, Msg).
-
 
 %% =============================================================================
 %% Internal helper functions
@@ -413,3 +443,24 @@ calculate_quorum_test() ->
 
 compare_take_larger(A, B) when A > B -> A;
 compare_take_larger(_, B) -> B.
+
+%% =============================================================================
+%% VR interface functions to service code
+%% =============================================================================
+execute_operation(SvcMod, Op) ->
+    %% Pass message to locally registered service code
+    SvcMod ! {?MODULE, Op},
+    %% Receive response from service code
+    %% NOTE: If execution fails, retry indefinitely while logging each error
+    void.
+
+execute_committed_operations(LatestState, LastLocalCommit) ->
+    NextCommit = LastLocalCommit + 1,
+    if
+        NextCommit =< LatestState#state.commit_number ->
+            %% NOTE: nth is 1-indexed
+            Op = lists:nth(NextCommit, LatestState#state.log),
+            execute_operation(LatestState#state.service_module, Op),
+            execute_committed_operations(LatestState, NextCommit);
+        true -> ok
+    end.

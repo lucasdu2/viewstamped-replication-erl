@@ -1,4 +1,4 @@
--module(kv).
+-module(kv_simple).
 -behaviour(gen_server).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2,
          code_change/3]).
@@ -6,7 +6,7 @@
          get_value/2]).
 
 %% NOTE: From the documentation, if a callback function fails or returns a bad
-%%% value, the gen_server process terminates.
+%% value, the gen_server process terminates.
 
 start_link() ->
     gen_server:start_link(?MODULE, [], []).
