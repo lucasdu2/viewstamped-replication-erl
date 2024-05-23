@@ -11,6 +11,9 @@
                 op_number=0,
                 log=[],
                 commit_number=0,
+                %% NOTE: The client ID key should be {node, client-process-id}.
+                %% This tuple should be unique in an Erlang system and will
+                %% also give VR the address for responses to client requests.
                 client_table=maps:new(),
                 %% Below: state needed for view change protocol
                 start_vc_count=0,
@@ -20,7 +23,7 @@
                 %% Below: state needed for protocol message deduplication
                 start_vc_cache=sets:new(),
                 do_vc_cache=sets:new(),
-                %% Below: service module name
+                %% Below: state for interface to user code
                 service_module}).
 -type state() :: #state{}.
 
@@ -233,6 +236,10 @@ process_do_viewchange(StateV, MsgV, State, Msg) when MsgV >= StateV ->
             Quorum = calculate_quorum(NewState),
             %% Send STARTVIEW message when quorum is reached
             send_start_view(NewCnt, Quorum, NewState),
+            %% TODO: On primary, also need to execute committed but unexecuted
+            %% operations, update client table, and send responses to clients.
+            %% We actually might need to wait to update the commit number on the
+            %% primary until we "catch up" with local executions.
             NewState
     end;
 process_do_viewchange(_, _, State, _) -> State.
@@ -242,7 +249,14 @@ handle_do_viewchange(State, Msg) ->
     #start_viewchange{view_number = MsgV} = Msg,
     process_do_viewchange(StateV, MsgV, State, Msg).
 
+%% TODO: Work through this part of the protocol next
 handle_start_view(State, Msg) ->
+    %% TODO: On backup replicas that receive the STARTVIEW message, need to
+    %% first send PREPAREOK messages to the primary for all uncommitted entries
+    %% in the log, then execute all operations known to be committed locally
+    %% (and update the local commit number and client table).
+    %% It's probably time to work on the regular VR protocol operation, since
+    %% this stuff is closely linked to that.
     State.
 
 %% @doc After a STARTVIEW message is sent to initiate a new view, both the new
@@ -253,9 +267,9 @@ handle_unexecuted_committed(LocalState, LatestState) ->
     LocalCommit = LocalState#state.commit_number,
     LatestCommit = LatestState#state.commit_number,
     %% Execute all missing commits locally, updating client table
-
+    execute_committed_operations(LatestState, LocalState#state.commit_number),
     %% If primary, send corresponding replies to clients
-    LatestState.
+    LocalState.
 
 %% =============================================================================
 %% Exported functions, main execution loop
@@ -280,21 +294,7 @@ start(Cfg, SvcMod, SvcInitArgs) ->
     register(?MODULE, spawn(fun() -> loop(State) end)),
     ok.
 
-%% General purpose execution loop for service code server
-loop_service(SvcMod, OldState) ->
-    receive
-        {From, Request} ->
-            try SvcMod:handle(Request, OldState) of
-                {Response, NewState} ->
-                    From ! {ok, Response},
-                    loop_service(SvcMod, NewState)
-            catch
-                _: Why ->
-                    From ! {crash, Why},
-                    loop_service(SvcMod, OldState)
-            end
-    end.
-
+%% Main execution loop for VR protocol
 loop(State) ->
     I = State#state.replica_number,
     V = State#state.view_number,
@@ -393,18 +393,6 @@ receive_msg(From, Msg, Handler, State) ->
 %% Internal helper functions
 %% =============================================================================
 
-%% @doc Loads an initial configuration from a local file.
-load_config(File) ->
-    {Ret, Content} = file:read_file(File),
-    case Ret of
-        ok ->
-            SplitBin = binary:split(Content, <<"\n">>, [global]),
-            SortBin = lists:sort(SplitBin),
-            SortedCfg = lists:map(fun(Bin) -> binary_to_atom(Bin) end, SortBin),
-            {ok, SortedCfg};
-        error -> {error, Content}
-    end.
-
 %% @doc Finds the index number of a node in the configuration
 %% NOTE: Can we do something more efficient, like a binary search?
 lookup_node_index(_, [], _) -> -1;
@@ -444,15 +432,45 @@ calculate_quorum_test() ->
 compare_take_larger(A, B) when A > B -> A;
 compare_take_larger(_, B) -> B.
 
+log_error(Name, Request, Why) ->
+    io:format("Server ~p request ~p caused exception ~p~n",
+              [Name, Request, Why]).
+
 %% =============================================================================
 %% VR interface functions to service code
 %% =============================================================================
+
+%% General purpose execution loop for service code server
+loop_service(SvcMod, OldState) ->
+    receive
+        {From, Request} ->
+            try SvcMod:handle(Request, OldState) of
+                {Response, NewState} ->
+                    From ! {ok, Response},
+                    loop_service(SvcMod, NewState)
+            catch
+                _: Why ->
+                    From ! {crash, Why},
+                    loop_service(SvcMod, OldState)
+            end
+    end.
+
 execute_operation(SvcMod, Op) ->
     %% Pass message to locally registered service code
     SvcMod ! {?MODULE, Op},
     %% Receive response from service code
-    %% NOTE: If execution fails, retry indefinitely while logging each error
-    void.
+    %% NOTE: If execution fails, retry indefinitely while logging each error.
+    %% It's up to the administrator to see this problem, since it will block
+    %% any other action on this VR replica.
+    receive
+        {crash, Why} ->
+            timer:sleep(2000),
+            log_error(SvcMod, Op, Why),
+            execute_operation(SvcMod, Op);
+        {ok, Response} ->
+            {ClientId, _Request} = Op,
+            {ClientId, Response}
+    end.
 
 execute_committed_operations(LatestState, LastLocalCommit) ->
     NextCommit = LastLocalCommit + 1,
@@ -460,7 +478,13 @@ execute_committed_operations(LatestState, LastLocalCommit) ->
         NextCommit =< LatestState#state.commit_number ->
             %% NOTE: nth is 1-indexed
             Op = lists:nth(NextCommit, LatestState#state.log),
-            execute_operation(LatestState#state.service_module, Op),
-            execute_committed_operations(LatestState, NextCommit);
-        true -> ok
+            SvcMod = LatestState#state.service_module,
+            {ClientId, Response} = execute_operation(SvcMod, Op),
+            %% Update client table with new response
+            OldClientTable = LatestState#state.client_table,
+            NewClientTable = maps:put(ClientId, Response, OldClientTable),
+            OpExecutedState = LatestState#state{client_table = NewClientTable,
+                                                commit_number = NextCommit},
+            execute_committed_operations(OpExecutedState, NextCommit);
+        true -> LatestState
     end.
