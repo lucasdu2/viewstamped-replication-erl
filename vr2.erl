@@ -192,7 +192,12 @@ send_start_view(C, Q, State) when C >= Q ->
         {error, Fails} ->
             io:format("Message failed to send to: ~p~n", Fails)
     end,
+    %% TODO: On primary, also need to execute committed but unexecuted
+    %% operations, update client table, and send responses to clients.
+    %% We actually might need to wait to update the commit number on the
+    %% primary until we "catch up" with local executions.
     handle_unexecuted_committed(State, NewState);
+
 send_start_view(_, _, State) -> State.
 
 compare_commit_numbers(NewDoVC, State) ->
@@ -236,10 +241,6 @@ process_do_viewchange(StateV, MsgV, State, Msg) when MsgV >= StateV ->
             Quorum = calculate_quorum(NewState),
             %% Send STARTVIEW message when quorum is reached
             send_start_view(NewCnt, Quorum, NewState),
-            %% TODO: On primary, also need to execute committed but unexecuted
-            %% operations, update client table, and send responses to clients.
-            %% We actually might need to wait to update the commit number on the
-            %% primary until we "catch up" with local executions.
             NewState
     end;
 process_do_viewchange(_, _, State, _) -> State.
@@ -267,9 +268,11 @@ handle_unexecuted_committed(LocalState, LatestState) ->
     LocalCommit = LocalState#state.commit_number,
     LatestCommit = LatestState#state.commit_number,
     %% Execute all missing commits locally, updating client table
-    execute_committed_operations(LatestState, LocalState#state.commit_number),
-    %% If primary, send corresponding replies to clients
-    LocalState.
+    %% NOTE: On primary, also need to send send replies to clients
+    I = State#state.replica_number,
+    V = State#state.view_number,
+    LastLocalCommit = LocalState#state.commit_number,
+    execute_committed_operations(LatestState, LastLocalCommit, I =:= V).
 
 %% =============================================================================
 %% Exported functions, main execution loop
@@ -472,7 +475,26 @@ execute_operation(SvcMod, Op) ->
             {ClientId, Response}
     end.
 
-execute_committed_operations(LatestState, LastLocalCommit) ->
+%% TODO: See if there is some way to programmatically ensure that ClientId has
+%% the required structure--{ProcessName, Node}--for the message passing
+%% construct to work. Ideally, we would return a helpful error if this is not
+%% formatted properly. This is also a contract that the VR proxy code could
+%% enforce, which I guess would bubble up the probem fairly quickly when a
+%% user is writing their code.
+send_committed_execution_results(ClientId, Response, Retries, true) ->
+    %% Return result to registered client process on other node
+    ClientId ! {node(), Response},
+    receive
+        {From, ok} when From =:= ClientId -> ok
+    after 500 ->
+        case Retries of
+            0 -> {error, ClientId};
+            _ -> send_committed_execution_results(ClientId, Response, Retries-1, true)
+        end
+    end;
+send_committed_execution_results(_, _, _, false) -> ok.
+
+execute_committed_operations(LatestState, LastLocalCommit, IsPrimary) ->
     NextCommit = LastLocalCommit + 1,
     if
         NextCommit =< LatestState#state.commit_number ->
@@ -485,6 +507,9 @@ execute_committed_operations(LatestState, LastLocalCommit) ->
             NewClientTable = maps:put(ClientId, Response, OldClientTable),
             OpExecutedState = LatestState#state{client_table = NewClientTable,
                                                 commit_number = NextCommit},
-            execute_committed_operations(OpExecutedState, NextCommit);
+            %% TODO: Is there a more elegant way to do this besides passing
+            %% IsPrimary around?
+            send_committed_execution_results(ClientId, Response, 3, IsPrimary),
+            execute_committed_operations(OpExecutedState, NextCommit, IsPrimary);
         true -> LatestState
     end.
