@@ -6,7 +6,7 @@
                 configuration,
                 replica_number,
                 view_number=0,
-                status="normal",
+                status='normal' :: status(),
                 last_normal_view=0,
                 op_number=0,
                 log=[],
@@ -27,8 +27,13 @@
                 service_module}).
 -type state() :: #state{}.
 
+-type status() :: 'normal' | 'view-change'.
+
 -record(commit, {view_number, commit_number}).
 -type commit() :: #commit{}.
+
+-record(prepare_ok, {view_number, op_number, replica_number}).
+-type prepare_ok() :: #prepare_ok{}.
 
 -record(start_viewchange, {view_number, replica_number}).
 -type start_vc() :: #start_viewchange{}.
@@ -45,7 +50,7 @@
 -type start_v() :: #start_view{}.
 
 -type vc_msg() :: start_vc() | do_vc() | start_v().
--type norm_msg() :: commit().
+-type norm_msg() :: commit() | prepare_ok().
 
 -type msg() :: norm_msg() | vc_msg().
 
@@ -68,7 +73,7 @@ handle_commit(State, Msg) ->
     %% message counter and cache
     %% NOTE: This handles the case where a replica enters the view-change
     %% protocol, but then reconnects with the primary
-    State#state{status         = "normal",
+    State#state{status         = 'normal',
                 view_number    = Msg#commit.view_number,
                 commit_number  = Msg#commit.commit_number,
                 start_vc_count = 0,
@@ -79,7 +84,7 @@ send_start_viewchange(State) ->
     I = State#state.replica_number,
     Cfg = State#state.configuration,
     case State#state.status of
-        "normal" ->
+        'normal' ->
             %% Increment view number
             NewV = V + 1,
             %% Increment local STARTVIEWCHANGE message counter
@@ -87,9 +92,9 @@ send_start_viewchange(State) ->
             Msg = #start_viewchange{view_number=NewV, replica_number=I},
             %% Update state
             NewState = State#state{view_number=NewV,
-                                   status="view-change",
+                                   status='view-change',
                                    start_vc_count=NewCnt};
-        "view-change" ->
+        'view-change' ->
             Msg = #start_viewchange{view_number=V, replica_number=I},
             %% Retain current state
             NewState = State
@@ -176,7 +181,7 @@ send_start_view(C, Q, State) when C >= Q ->
                            log           = NewLog,
                            op_number     = NewOp,
                            commit_number = MaxCommit,
-                           status        = "normal",
+                           status        = 'normal',
                            %% Clear relevant view change metadata
                            do_vc_count          = 0,
                            max_vc_commit_number = 0,
@@ -250,27 +255,60 @@ handle_do_viewchange(State, Msg) ->
     #start_viewchange{view_number = MsgV} = Msg,
     process_do_viewchange(StateV, MsgV, State, Msg).
 
-%% TODO: Work through this part of the protocol next
-handle_start_view(State, Msg) ->
-    %% TODO: On backup replicas that receive the STARTVIEW message, need to
-    %% first send PREPAREOK messages to the primary for all uncommitted entries
-    %% in the log, then execute all operations known to be committed locally
-    %% (and update the local commit number and client table).
-    %% It's probably time to work on the regular VR protocol operation, since
-    %% this stuff is closely linked to that.
-    State.
-
 %% @doc After a STARTVIEW message is sent to initiate a new view, both the new
 %% primary and new backups need to perform some state updates in order to make
 %% sure everything (log, client table, actual on-replica data--i.e. a key-value
 %% store we are replicating with VR) are properly synchronized.
+handle_start_view(State, Msg) ->
+    #start_view{view_number   = NewV,
+                log           = NewLog,
+                op_number     = NewOp,
+                commit_number = MaxCommit} = Msg,
+    NewState = State#state{log = NewLog,
+                           op_number = NewOp,
+                           view_number = NewV,
+                           status = 'normal',
+                           commit_number = MaxCommit},
+    %% Send PREPAREOK to primary for all non-committed operations in the log
+    prepare_all_noncommitted(NewState),
+    handle_unexecuted_committed(State, NewState).
+
+build_prepare_ok(State) ->
+    #state{view_number = V,
+           op_number = Op,
+           replica_number = I} = State,
+    #prepare_ok{view_number = V,
+                op_number = Op,
+                replica_number = I}.
+
+send_prepare_ok(State) ->
+    PrepareOkMsg = build_prepare_ok(State),
+    Primary = calculate_primary_from_view(State),
+    case send_msg(PrepareOkMsg, [Primary], 3) of
+        ok -> ok;
+        {error, _} ->
+            io:format("Message failed to send to: ~p~n", Primary)
+    end.
+
+prepare_noncommitted(NextOp, LastOp, State) ->
+    if
+        NextOp =< LastOp ->
+            send_prepare_ok(State),
+            prepare_noncommitted(NextOp + 1, LastOp, State);
+        true -> ok
+    end.
+
+prepare_all_noncommitted(LatestState) ->
+    #state{op_number = Op,
+           commit_number = Commit} = LatestState,
+    %% For Commit to Op, send PREPAREOK to primary for that operation
+    prepare_noncommitted(Commit + 1, Op, LatestState).
+
 handle_unexecuted_committed(LocalState, LatestState) ->
-    LocalCommit = LocalState#state.commit_number,
-    LatestCommit = LatestState#state.commit_number,
     %% Execute all missing commits locally, updating client table
     %% NOTE: On primary, also need to send send replies to clients
-    I = State#state.replica_number,
-    V = State#state.view_number,
+    I = LatestState#state.replica_number,
+    V = LatestState#state.view_number,
     LastLocalCommit = LocalState#state.commit_number,
     execute_committed_operations(LatestState, LastLocalCommit, I =:= V).
 
@@ -475,15 +513,13 @@ execute_operation(SvcMod, Op) ->
             {ClientId, Response}
     end.
 
-%% TODO: See if there is some way to programmatically ensure that ClientId has
-%% the required structure--{ProcessName, Node}--for the message passing
-%% construct to work. Ideally, we would return a helpful error if this is not
-%% formatted properly. This is also a contract that the VR proxy code could
-%% enforce, which I guess would bubble up the probem fairly quickly when a
-%% user is writing their code.
 send_committed_execution_results(ClientId, Response, Retries, true) ->
     %% Return result to registered client process on other node
-    ClientId ! {node(), Response},
+    %% NOTE: ClientId must be of the form {ProcessName, Node} for the message
+    %% passing construct to work. We unpack the variable first to try to return
+    %% a more descriptive error if it is ill-formed.
+    {ProcessName, Node} = ClientId,
+    {ProcessName, Node} ! {node(), Response},
     receive
         {From, ok} when From =:= ClientId -> ok
     after 500 ->
@@ -494,6 +530,7 @@ send_committed_execution_results(ClientId, Response, Retries, true) ->
     end;
 send_committed_execution_results(_, _, _, false) -> ok.
 
+-spec execute_committed_operations(state(), integer(), boolean()) -> state().
 execute_committed_operations(LatestState, LastLocalCommit, IsPrimary) ->
     NextCommit = LastLocalCommit + 1,
     if
