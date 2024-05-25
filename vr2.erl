@@ -1,6 +1,6 @@
 -module(vr2).
 -include_lib("eunit/include/eunit.hrl").
--export([start/3, send2others/3]).
+-export([init/3, send2others/3]).
 
 -record(state, {%% Below: state specified in paper
                 configuration,
@@ -65,7 +65,7 @@ send_commit(State) ->
     Cfg = State#state.configuration,
     case send2others(Msg, Cfg, 3) of
         ok -> ok;
-        {error, Fails} -> io:format("Message failed to send to: ~p~n", Fails)
+        {error, Fails} -> logger:error("Message failed to send to: ~p~n", Fails)
     end.
 
 handle_commit(State, Msg) ->
@@ -103,7 +103,7 @@ send_start_viewchange(State) ->
     case send2others(Msg, Cfg, 3) of
         ok -> ok;
         {error, Fails} ->
-            io:format("Message failed to send to: ~p~n", Fails)
+            logger:error("Message failed to send to: ~p~n", Fails)
     end,
     NewState.
 
@@ -127,7 +127,7 @@ send_do_viewchange(C, Q, State) when C >= Q ->
     case send_msg(DoVCMsg, [NextPrimary], 3) of
         ok -> ok;
         {error, _} ->
-            io:format("Message failed to send to: ~p~n", NextPrimary)
+            logger:error("Message failed to send to: ~p~n", NextPrimary)
     end,
     %% Reset STARTVIEWCHANGE counter and message cache
     %% NOTE: If we don't reset here after sending a DOVIEWCHANGE message, we
@@ -195,7 +195,7 @@ send_start_view(C, Q, State) when C >= Q ->
     case send2others(Msg, Cfg, 3) of
         ok -> ok;
         {error, Fails} ->
-            io:format("Message failed to send to: ~p~n", Fails)
+            logger:error("Message failed to send to: ~p~n", Fails)
     end,
     %% TODO: On primary, also need to execute committed but unexecuted
     %% operations, update client table, and send responses to clients.
@@ -287,7 +287,7 @@ send_prepare_ok(State) ->
     case send_msg(PrepareOkMsg, [Primary], 3) of
         ok -> ok;
         {error, _} ->
-            io:format("Message failed to send to: ~p~n", Primary)
+            logger:error("Message failed to send to: ~p~n", Primary)
     end.
 
 prepare_noncommitted(NextOp, LastOp, State) ->
@@ -316,9 +316,11 @@ handle_unexecuted_committed(LocalState, LatestState) ->
 %% Exported functions, main execution loop
 %% =============================================================================
 
--spec start(list(atom()), atom(), list()) -> ok.
-start(Cfg, SvcMod, SvcInitArgs) ->
+-spec init(list(atom()), atom(), list()) -> ok.
+init(Cfg, SvcMod, SvcInitArgs) ->
     %% Sort cluster configuration in a deterministic way
+    %% NOTE: Cfg should consist of a list of atoms corresponding to node names
+    %% of all Erlang nodes in the VR cluster.
     SortCfg = lists:sort(Cfg),
     %% Set up initial cluster state
     I = lookup_node_index(node(), SortCfg, 0),
@@ -327,21 +329,24 @@ start(Cfg, SvcMod, SvcInitArgs) ->
                    client_table=maps:new(),
                    start_vc_cache=maps:new(),
                    service_module=SvcMod},
-    %% Spawn service code server
-    register(SvcMod,
-             spawn(fun() -> loop_service(SvcMod,
-                                         SvcMod:init(SvcInitArgs)) end)),
-    %% Spawn execution loop, register process with same name as module
-    register(?MODULE, spawn(fun() -> loop(State) end)),
+    %% Start VR execution, register process with same name as module
+    register(?MODULE, spawn(fun() -> start_vr(State, SvcMod, SvcInitArgs) end)),
     ok.
 
+start_vr(State, SvcMod, SvcInitArgs) ->
+    %% Spawn and link service code server
+    register(SvcMod,
+             spawn_link(fun() -> loop_service(SvcMod,
+                                              SvcMod:init(SvcInitArgs)) end)),
+    loop_vr(State).
+
 %% Main execution loop for VR protocol
-loop(State) ->
+loop_vr(State) ->
     I = State#state.replica_number,
     V = State#state.view_number,
     case {I, V} of
-        {Same, Same} -> loop(primary(State));
-        _ -> loop(backup(State))
+        {Same, Same} -> loop_vr(primary(State));
+        _ -> loop_vr(backup(State))
     end.
 
 primary(State) ->
@@ -356,7 +361,7 @@ primary(State) ->
         {From, StartV} when is_record(StartV, start_view) ->
             receive_msg(From, StartV, fun handle_start_view/2, State);
         Unexpected ->
-           io:format("Unexpected message on primary ~p~n", [Unexpected]),
+            logger:notice("Unexpected message on primary ~p~n", [Unexpected]),
             State
     after
         %% If no messages after brief interval, return state to continue
@@ -382,7 +387,7 @@ backup(State) ->
         {From, StartV} when is_record(StartV, start_view) ->
             receive_msg(From, StartV, fun handle_start_view/2, NewState);
         Unexpected ->
-            io:format("Unexpected message on backup ~p~n", [Unexpected]),
+            logger:notice("Unexpected message on backup ~p~n", [Unexpected]),
             NewState
     end.
 
@@ -473,9 +478,9 @@ calculate_quorum_test() ->
 compare_take_larger(A, B) when A > B -> A;
 compare_take_larger(_, B) -> B.
 
-log_error(Name, Request, Why) ->
-    io:format("Server ~p request ~p caused exception ~p~n",
-              [Name, Request, Why]).
+log_service_error(Name, Request, Why) ->
+    logger:error("Request ~p to service ~p caused exception ~p~n",
+              [Request, Name, Why]).
 
 %% =============================================================================
 %% VR interface functions to service code
@@ -506,7 +511,7 @@ execute_operation(SvcMod, Op) ->
     receive
         {crash, Why} ->
             timer:sleep(2000),
-            log_error(SvcMod, Op, Why),
+            log_service_error(SvcMod, Op, Why),
             execute_operation(SvcMod, Op);
         {ok, Response} ->
             {ClientId, _Request} = Op,
@@ -544,8 +549,6 @@ execute_committed_operations(LatestState, LastLocalCommit, IsPrimary) ->
             NewClientTable = maps:put(ClientId, Response, OldClientTable),
             OpExecutedState = LatestState#state{client_table = NewClientTable,
                                                 commit_number = NextCommit},
-            %% TODO: Is there a more elegant way to do this besides passing
-            %% IsPrimary around?
             send_committed_execution_results(ClientId, Response, 3, IsPrimary),
             execute_committed_operations(OpExecutedState, NextCommit, IsPrimary);
         true -> LatestState
